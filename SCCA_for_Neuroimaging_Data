@@ -1,0 +1,272 @@
+#CODE for SCCA analysis of the IMAGEN Cohort-Molecular Psychiatry
+##Code for analysis of cortical thickness at baseline (codes for analysis of cortical surface area and subcortical volume are similar)
+
+
+
+library(mixOmics)
+library(matrixStats)
+
+
+######------------------------------RSGCCA THICKNESS BASELINE-----------------------------####
+df1<-bl_dataset_impute
+colnames(df1)
+
+seq=seq(.1,1,length.out=10)
+df1<-scale(df1)
+colnames(df1)
+temppsych = list()
+temppsych$X1 = df1[,c(1:56)]
+temppsych$Y1 = df1[,c(128:197)]
+ncolx = ncol(temppsych$X1)
+ncoly = ncol(temppsych$Y1)
+seqj <- seq(1 / sqrt(ncolx), 0.99, length.out = 10)
+seqk <- seq(1 / sqrt(ncoly), 0.99, length.out = 10)
+
+##Cross-validation for finding best sparsity parameters
+scca_cv <- function(X, Y) {
+  set.seed(123)
+  matlist<-list()
+  for ( l in 1:5) {
+    nfolds=10
+  x <- perry::cvFolds(nrow(X), K = nfolds, type = "random")
+  ncolx = ncol(X)
+  ncoly = ncol(Y)
+  seqj <- seq(1 / sqrt(ncolx), 0.99, length.out = 10)
+  seqk <- seq(1 / sqrt(ncoly), 0.99, length.out = 10)
+  cor1 <- array(0, c(10,10,nfolds))
+  iter = 0
+  for (i in 1:nfolds) {
+    for (j in seq(1 / sqrt(ncolx), 0.99, length.out = 10)) {
+      for (k in seq(1 / sqrt(ncoly), 0.99, length.out = 10)) {
+        iter = iter + 1
+        sampin <- x$subsets[x$which != i]
+        temppsych = list()
+        temppsych$X1 = X[sampin, ]
+        temppsych$Y1 = Y[sampin, ]
+        result.rgcca = wrapper.sgcca(
+          temppsych,
+          penalty = c(j, k),
+          ncomp = 1,
+          scheme = "centroid"
+        )
+        
+        sampout <- x$subsets[x$which == i]
+        temppsych = list()
+        temppsych$X1 = X[sampout, ]
+        temppsych$Y1 = Y[sampout, ]
+        cor1[which(seqj == j), which(seqk == k), i] <-
+          mean(abs(
+            cor(
+              temppsych$X1 %*% result.rgcca$loadings$X1,
+              temppsych$Y1 %*% result.rgcca$loadings$Y1
+            
+          )))
+        print(iter)
+      }
+    }
+  }
+  matlist[[l]] <- apply(abs(cor1), c(1, 2), mean)
+  }
+  mat<-(matlist[[1]]+matlist[[2]]+matlist[[3]]+matlist[[4]]+matlist[[5]])/5
+  return(which(mat == max(mat), arr.ind = T))
+}
+
+penalty_thickness<-scca_cv(temppsych$X1,temppsych$Y1)
+
+result.rgcca = wrapper.sgcca(temppsych,
+                             penalty = c(seqj[2],seqk[5]),
+                             ncomp = 5,scheme="centroid")
+                             
+cor_baseline_thickness<-diag(cor(result.rgcca$variates$X1,result.rgcca$variates$Y1))
+weights_baseline_thickness_clinical<-result.rgcca$loadings$X1
+weights_baseline_thickness_imaging<-result.rgcca$loadings$Y1
+crossloadings_baseline_thickness_clinical<-cor(temppsych$X1,result.rgcca$variates$Y1)
+crossloadings_baseline_thickness_imaging<-cor(temppsych$Y1, result.rgcca$variates$X1)
+loadings_baseline_thickness_clinical<-cor(temppsych$X1,result.rgcca$variates$X1)
+loadings_baseline_thickness_imaging<-cor(temppsych$Y1, result.rgcca$variates$Y1)
+variance_explained_baseline_thickness<-result.rgcca$explained_variance
+plotdf<-as.data.frame(diag(cor(result.rgcca$variates$X1,result.rgcca$variates$Y1))^2)*100
+plotdf$components<-c(1:5)
+names(plotdf)[1:2]<-c("Variance_Explained", "Components")
+ggplot(plotdf, aes(x=Components, y=Variance_Explained)) + 
+  geom_point()+
+  geom_smooth(method=loess)
+
+
+#permutation testing and p-value calculation
+numCores <- detectCores()
+perm<-1:1000
+corperm_mat<-matrix(0,1000,10)
+set.seed(123)
+permfunc<-function(perm) {
+  sampperm<-sample(nrow(temppsych$Y1),replace=F)
+  temppsych = list()
+  temppsych$X1<-df1[,c(1:56)]
+  temppsych$Y1<-df1[sampperm,c(128:197)]
+  result.rgcca = wrapper.sgcca(temppsych,
+                               penalty = c(seqj[2],seqk[1]),
+                               ncomp = 5,scheme="centroid")
+  corperm_mat[perm,]<-diag(cor(result.rgcca$variates$X1,result.rgcca$variates$Y1))
+}
+results <- mclapply(perm, permfunc, mc.cores = numCores-5)
+corperm_mat<-matrix(unlist(results),5,1000)
+permuted_cor_thickbaseline<-cbind(rowMeans(abs(corperm_mat)),rowSds(abs(corperm_mat)))
+
+pval_thickness_baseline <- c()
+for (i in 1:5) {
+  pval_thickness_baseline[i] <-
+    length(which (abs(corperm_mat[i, ]) > abs(
+      cor_baseline_thickness[i]))) / 1000
+}
+
+
+#RELIABILITY-REPRODUCIBILITY ANALYSES
+
+#split-half correlations
+perm=1:500
+temppsych = list()
+temppsych$X1 = df1[,c(1:56)]
+temppsych$Y1 = df1[,c(128:197)]
+cortraintest<-array(0,c(500,5,2))
+set.seed(123)
+scca_splithalf_cor <- function(perm) {
+  trainsamp<-sample(nrow(temppsych$X1),size=0.5*nrow(temppsych$X1),replace=F)
+  trainlist = list()
+  trainlist$X1 = temppsych$X1[trainsamp, ]
+  trainlist$Y1 = temppsych$Y1[trainsamp, ]
+  result.rgcca = wrapper.sgcca(
+    trainlist,penalty = c(seqj[2], seqk[5]),ncomp = 5,
+    scheme = "centroid"
+  )
+  testlist = list()
+  testlist$X1 = temppsych$X1[-trainsamp, ]
+  testlist$Y1 = temppsych$Y1[-trainsamp, ]
+  loadingretest<-cbind(rowMaxs(abs(cor(loadings_baseline_thickness_clinical,cor(trainlist$X1,result.rgcca$variates$X1)))),
+                       rowMaxs(abs(cor(loadings_baseline_thickness_imaging,cor(trainlist$Y1,result.rgcca$variates$Y1)))))
+  cortraintest[perm,order(rowMeans(loadingretest),decreasing=T),] <-cbind(diag(
+    cor(
+      temppsych$X1 %*% result.rgcca$loadings$X1,
+      temppsych$Y1 %*% result.rgcca$loadings$Y1
+    )), diag(
+      cor(
+        testlist$X1 %*% result.rgcca$loadings$X1,
+        testlist$Y1 %*% result.rgcca$loadings$Y1
+      )
+    ))
+}
+
+results <- mclapply(perm, scca_splithalf_cor, mc.cores = numCores-1)
+cortraintest<-results
+cortrain_thickness_baseline<-matrix(0,500,5)
+cortest_thickness_baseline<-matrix(0,500,5)
+for ( i in 1:500) {
+  cortrain_thickness_baseline[i,]<-cortraintest[[i]][,1]
+  cortest_thickness_baseline[i,]<-cortraintest[[i]][,2]
+}
+
+for ( i in 1:500) {
+  for ( j in 1:5) {
+    cortest_thickness_baseline[i,j]<-ifelse(cortrain_thickness_baseline[i,j]<0,cortest_thickness_baseline[i,j]*-1,cortest_thickness_baseline[i,j])
+    cortrain_thickness_baseline[i,j]<-ifelse(cortrain_thickness_baseline[i,j]<0,cortrain_thickness_baseline[i,j]*-1,cortrain_thickness_baseline[i,j])
+    
+  }
+}
+cortraintest_thickness_baseline<-rbind(colMeans(cortrain_thickness_baseline),colMeans(cortest_thickness_baseline),
+                                       colSds(cortrain_thickness_baseline),colSds(cortest_thickness_baseline))
+
+
+
+
+#resampling stability
+df1<-bl_dataset_impute
+df1<-scale(df1)
+temppsych = list()
+temppsych$X1 = df1[,c(1:56)]
+temppsych$Y1 = df1[,c(128:197)]
+set.seed(123)
+perm=1:100
+boot_func<-function(perm) {
+  cor_boot_thickness_baseline<-matrix(0,15,1)
+  sampleseq<- c(.1,.2,.3,.4,.5,.6,.7,.8,.9,1,1.1,1.2,1.3,1.4,1.5)
+  for (j in sampleseq) {
+    training<- sample(nrow(df1), ceiling(j*nrow(df1)), replace=T )
+    temppsych = list()
+    temppsych$X1 = df1[training,c(1:56)]
+    temppsych$Y1 = df1[training,c(128:197)]
+    rownames(temppsych$X1)<-seq(1,ceiling(j*nrow(df1)))
+    rownames(temppsych$Y1)<-seq(1,ceiling(j*nrow(df1)))
+    result.rgcca = wrapper.sgcca(
+      temppsych,penalty = c(seqj[2],seqk[5]),ncomp = 1,
+      scheme = "centroid")
+    cor_boot_thickness_baseline[which(sampleseq==j),]<-diag(cor(result.rgcca$variates$X1,
+                                                            result.rgcca$variates$Y1))
+  }
+  return(cor_boot_thickness_baseline)
+}
+
+results <- mclapply(perm, boot_func, mc.cores = numCores-1)
+absresults<-lapply(results,abs)
+thickness_baseline_resample<-t(matrix(unlist(absresults),15,100))
+
+
+
+
+
+#RR SCORE
+df1<-bl_dataset_impute; df1<-scale(df1); colnames(df1)
+temppsych = list()
+temppsych$X1 = df1[,c(1:56)]
+temppsych$Y1 = df1[,c(128:197)]
+dim(temppsych$Y1)
+crossloadings_baseline_thickness_clinical_resample<-array(0,c(dim(temppsych$X1)[2],500,3))
+crossloadings_baseline_thickness_imaging_resample<-array(0,c(dim(temppsych$Y1)[2],500,3))
+set.seed(123)
+perm=1:500
+rr_func=function(perm) {
+  training<- sample(nrow(df1), 0.5*nrow(df1), replace=F )
+  dftraining<-df1[training,]
+  dftesting<-df1[-training,]
+  temppsych = list()
+  temppsych$X1 = as.matrix(dftraining[,c(1:56)])
+  temppsych$Y1 = as.matrix(dftraining[,c(128:197)])
+  testpsych=list()
+  testpsych$X1 = as.matrix(dftesting[,c(1:56)])
+  testpsych$Y1 = as.matrix(dftesting[,c(128:197)])
+  result.rgcca<-wrapper.sgcca(
+    temppsych,penalty = c(seqj[2],seqk[5]),ncomp = 5,
+    scheme = "centroid")
+  return(list(cor(testpsych$X1,testpsych$Y1%*%result.rgcca$loadings$Y1),cor(testpsych$Y1,testpsych$X1%*%result.rgcca$loadings$X1)))
+}
+results <- mclapply(perm, rr_func, mc.cores = numCores-1)
+for (j in 1:500) {
+  for ( i in 1:5) {
+      if (cor(crossloadings_baseline_thickness_clinical[,i],
+              results[[j]][[1]][,i])<0) {
+        results[[j]][[1]][,i]<-results[[j]][[1]][,i]*-1 
+      }
+}
+}
+for (j in 1:500) {
+  for ( i in 1:5) {
+    if (cor(crossloadings_baseline_thickness_imaging[,i],
+            results[[j]][[2]][,i])<0) {
+      results[[j]][[2]][,i]<-results[[j]][[2]][,i]*-1 
+    }
+  }
+}
+rr_thickness_baseline_clinical<-matrix(0,500,5)
+for (i in 1:500) {
+    rr_thickness_baseline_clinical[i,]<-
+      rowMaxs(cor(results[[i]][[1]],crossloadings_baseline_thickness_clinical))
+  }
+rr_thickness_baseline_imaging<-matrix(0,500,5)
+for (i in 1:500) {
+  rr_thickness_baseline_imaging[i,]<-
+    rowMaxs(cor(results[[i]][[2]],crossloadings_baseline_thickness_imaging))
+}
+rr_thickness_baseline_total<- (rr_thickness_baseline_clinical+rr_thickness_baseline_imaging)/2
+colMedians(rr_thickness_baseline_total);colQuantiles(rr_thickness_baseline_total)
+
+
+
+
